@@ -1,23 +1,108 @@
-# Integrated MCP Client Service
+# MCP Client Service for n8n Integration
 
-This service acts as both an MCP client and a launcher for MCP servers. It can run Node.js-based MCP servers locally and expose them through a unified API, making it easy to use with n8n's HTTP Request nodes.
+This service acts as a bridge between n8n and Model Context Protocol (MCP) servers. It enables n8n workflows to interact with MCP servers by providing a standardized HTTP API that handles the complexity of the MCP protocol behind the scenes.
 
-## Features
+## What this service does
 
-- **Run MCP Servers**: Automatically downloads and runs MCP servers from npm
-- **API Gateway**: Provides a unified API to communicate with MCP servers
-- **Configuration Management**: Manage multiple MCP server configurations
-- **Authentication**: Secure API key authentication
-- **Process Management**: Handles starting, stopping, and monitoring MCP server processes
+The MCP Client Service provides three core functionalities:
+
+1. **List Available MCP Servers**: Returns a list of all configured MCP servers with their descriptions, allowing an AI agent in n8n to discover which specialized tools are available.
+
+2. **Discover Tools from an MCP Server**: Queries a specific MCP server to list all available tools and their schemas, following the MCP protocol specification.
+
+3. **Execute Tool Calls**: Allows executing specific tools on an MCP server and returning the results, making external functionality available to n8n workflows.
+
+## How it works
+
+This service:
+
+1. **Spawns Local MCP Servers**: Automatically downloads and runs Node.js-based MCP servers locally using the configurations defined in `servers.json`.
+
+2. **Translates HTTP to MCP Protocol**: Converts standard HTTP requests from n8n into the proper MCP protocol format.
+
+3. **Manages Server Lifecycle**: Handles starting, monitoring, and gracefully shutting down MCP server processes.
+
+4. **Secures Access**: Provides API key authentication to ensure only authorized clients can access the service.
 
 ## Pre-configured MCP Servers
 
 This service comes pre-configured with the following MCP servers:
 
-1. **Todoist** (@abhiz123/todoist-mcp-server)
-2. **Fetch** (@modelcontextprotocol/server-fetch)
-3. **Slack** (@modelcontextprotocol/server-slack)
-4. **Memory** (@modelcontextprotocol/server-memory)
+1. **Todoist** (@abhiz123/todoist-mcp-server): Interact with Todoist tasks and projects
+2. **Memory** (@modelcontextprotocol/server-memory): Store and retrieve information in a persistent memory store
+3. **Slack** (@modelcontextprotocol/server-slack): Send and manage messages in Slack
+4. **Brave Search** (@modelcontextprotocol/server-brave-search): Perform web searches using Brave Search
+
+## Configuration
+
+### MCP Server Configuration
+
+MCP servers are configured in the `servers.json` file with the following structure:
+
+```json
+{
+  "mcpServers": {
+    "server-id": {
+      "command": "npx",
+      "args": ["@package/name"],
+      "env": {
+        "API_KEY": "your-api-key"
+      }
+    }
+  }
+}
+```
+
+### Environment Variables
+
+Required environment variables are stored in the `.env` file:
+
+```
+API_KEY=your-service-api-key
+ALLOWED_ORIGINS=https://your-n8n-instance.example.com,http://localhost:5678
+BRAVE_API_KEY=your-brave-search-api-key
+SLACK_BOT_TOKEN=your-slack-bot-token
+SLACK_TEAM_ID=your-slack-team-id
+TODOIST_API_TOKEN=your-todoist-api-token
+```
+
+- `API_KEY`: Authentication key for accessing this service
+- `ALLOWED_ORIGINS`: Comma-separated list of domains allowed to make cross-origin requests to this service (required when deployed to production with n8n)
+- `BRAVE_API_KEY`: API key for Brave Search MCP server
+- `SLACK_BOT_TOKEN` & `SLACK_TEAM_ID`: Credentials for Slack MCP server
+- `TODOIST_API_TOKEN`: API token for Todoist MCP server
+
+## API Endpoints
+
+### Health Check
+```
+GET /health
+```
+Returns the health status of the service and information about configured servers.
+
+### List All MCP Servers
+```
+GET /servers
+```
+Returns a list of all configured MCP servers with their status and metadata.
+
+### Discover Tools from an MCP Server
+```
+GET /server/{server_id}/tools
+```
+Returns a list of all tools available from the specified MCP server, including their schemas.
+
+### Call an MCP Server
+```
+POST /call/{server_id}
+```
+Sends a full MCP protocol request to the specified server.
+
+### Make a Tool Call
+```
+POST /tool-call/{server_id}
+```
+Simplified endpoint to execute a single tool call on the specified MCP server.
 
 ## Deployment on Render
 
@@ -28,7 +113,7 @@ This service comes pre-configured with the following MCP servers:
 3. Choose a name for your service
 4. Select "Python 3" as the runtime
 5. Set the build command: `pip install -r requirements.txt`
-6. Set the start command: `python mcp_client_updated.py`
+6. Set the start command: `python mcp-client.py`
 
 ### 2. Set Environment Variables
 
@@ -38,13 +123,13 @@ Add the following environment variables:
 - `NODE_VERSION`: `16` or higher (to ensure Node.js is available)
 - `NPM_CONFIG_PRODUCTION`: `false` (to ensure dev dependencies are installed)
 
-### 3. Add Environment-Specific API Keys (Optional)
+### 3. Add Service-Specific API Keys
 
-For services that require API keys, add them as environment variables:
+Add the necessary API keys for the MCP servers you want to use:
 
+- `BRAVE_API_KEY`: For Brave Search
+- `SLACK_BOT_TOKEN` and `SLACK_TEAM_ID`: For Slack integration
 - `TODOIST_API_TOKEN`: For Todoist integration
-- `SLACK_TOKEN`: For Slack integration
-- etc.
 
 ## Using with n8n
 
@@ -52,11 +137,15 @@ For services that require API keys, add them as environment variables:
 
 Send a GET request to `/health` to verify the service is running.
 
-### 2. List available servers
+### 2. List available MCP servers
 
 Send a GET request to `/servers` with your API key in the `X-API-Key` header.
 
-### 3. Make tool calls
+### 3. Discover tools from a server
+
+Send a GET request to `/server/{server_id}/tools` with your API key in the `X-API-Key` header.
+
+### 4. Make tool calls
 
 In your n8n workflow, add an HTTP Request node with:
 
@@ -76,60 +165,20 @@ In your n8n workflow, add an HTTP Request node with:
   }
   ```
 
-## API Endpoints
+## Technical Implementation
 
-### Health Check
-```
-GET /health
-```
+This service uses:
+- **FastAPI**: For the HTTP API layer
+- **MCP Python SDK**: For handling MCP protocol communication
+- **Node.js**: For spawning and managing local MCP servers
 
-### List All Servers
-```
-GET /servers
-```
+## Development
 
-### Call an MCP Server
-```
-POST /call/{server_id}
-```
+### Setting up the development environment
 
-### Make a Tool Call
-```
-POST /tool-call/{server_id}
-```
-
-### Configure an External MCP Server
-```
-POST /configure?server_id={server_id}
-```
-
-### Configure and Start a Local MCP Server
-```
-POST /configure-local?server_id={server_id}
-```
-
-### Delete a Server
-```
-DELETE /servers/{server_id}
-```
-
-## Troubleshooting
-
-If you encounter issues with the Node.js processes not starting:
-
-1. Check the Render logs for any error messages
-2. Ensure Node.js 16+ is available in your environment
-3. Try restarting the service
-4. Make sure the npm packages are accessible
-
-## Security Considerations
-
-- Always use a strong API key
-- Consider adding rate limiting in production
-- For sensitive integrations, use environment variables for API keys
-
-## Limitations on Render
-
-- Render's free tier has limited RAM and CPU resources
-- Services may be put to sleep after inactivity
-- Node.js process management can be resource-intensive
+1. Clone the repository
+2. Create a virtual environment: `python -m venv venv`
+3. Activate the virtual environment: `source venv/bin/activate` (Linux/Mac) or `venv\Scripts\activate` (Windows)
+4. Install dependencies: `pip install -r requirements.txt`
+5. Create a `.env` file with the necessary API keys
+6. Run the service: `python mcp-client.py`

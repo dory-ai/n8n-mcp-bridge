@@ -1,6 +1,9 @@
 {
   "mcpServers": {
     "todoist": {
+      "name": "Todoist MCP Server",
+      "description": "Provides tools for interacting with Todoist tasks, projects, and comments. Can create, update, and retrieve task information.",
+      "package": "@abhiz123/todoist-mcp-server",
       "command": "npx",
       "args": ["-y", "@abhiz123/todoist-mcp-server"],
       "env": {
@@ -8,11 +11,17 @@
       }
     },
     "memory": {
+      "name": "Memory MCP Server",
+      "description": "Offers tools for storing and retrieving information in a persistent memory store. Useful for remembering information across sessions.",
+      "package": "@modelcontextprotocol/server-memory",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-memory"],
       "env": {}
     },
     "slack": {
+      "name": "Slack MCP Server",
+      "description": "Allows interaction with Slack channels and messages. Can send messages, retrieve channel information, and manage conversations.",
+      "package": "@modelcontextprotocol/server-slack",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-slack"],
       "env": {
@@ -21,6 +30,9 @@
       }
     },
     "brave-search": {
+      "name": "Brave Search MCP Server",
+      "description": "Provides tools for web search using the Brave search engine. Can perform searches and return relevant web results.",
+      "package": "@modelcontextprotocol/server-brave-search",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-brave-search"],
       "env": {
