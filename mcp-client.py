@@ -14,6 +14,7 @@ from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+import threading
 
 # Load environment variables
 load_dotenv()
@@ -24,6 +25,20 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("mcp_client")
+
+# Load server configurations from JSON file
+def load_server_configs():
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "servers.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading server configurations: {str(e)}")
+            return {"mcpServers": {}}
+    else:
+        logger.warning(f"Server configuration file not found at {config_path}")
+        return {"mcpServers": {}}
 
 app = FastAPI(
     title="MCP Client Service",
@@ -84,6 +99,9 @@ mcp_servers: Dict[str, MCPConfig] = {}
 
 # Store running MCP server processes
 mcp_processes: Dict[str, Dict[str, Any]] = {}
+
+# Track used ports to avoid conflicts
+used_ports = set()
 
 # Create Node.js server runner script
 NODE_RUNNER_SCRIPT = """
@@ -255,30 +273,151 @@ def start_mcp_server(server_id: str, definition: MCPServerDefinition):
     
     return port
 
+# Start a server using Claude Desktop format configuration
+def start_server_claude_format(server_id: str, config: Dict[str, Any]):
+    if "command" not in config or not config["command"]:
+        logger.warning(f"Missing command for server '{server_id}'")
+        return
+    
+    command = config["command"]
+    args = config.get("args", [])
+    env_vars = config.get("env", {})
+    
+    # Check for required environment variables
+    if server_id == "slack" and (not env_vars.get("SLACK_BOT_TOKEN") or not env_vars.get("SLACK_TEAM_ID")):
+        logger.warning(f"Skipping '{server_id}' server: Missing required environment variables (SLACK_BOT_TOKEN, SLACK_TEAM_ID)")
+        return
+    
+    if server_id == "brave-search" and not env_vars.get("BRAVE_API_KEY"):
+        logger.warning(f"Skipping '{server_id}' server: Missing required environment variable (BRAVE_API_KEY)")
+        return
+    
+    if server_id == "todoist" and not env_vars.get("TODOIST_API_TOKEN"):
+        logger.warning(f"Skipping '{server_id}' server: Missing required environment variable (TODOIST_API_TOKEN)")
+        return
+    
+    # Get a free port for the server
+    start_port = 8100
+    end_port = 8999
+    server_port = find_free_port(start_port, end_port)
+    if not server_port:
+        raise Exception(f"No free ports available in range {start_port}-{end_port}")
+    
+    logger.info(f"Starting MCP server '{server_id}' (command: {command}) on port {server_port}")
+    
+    # For npx servers, we can use the existing NODE_RUNNER_SCRIPT
+    if command == "npx":
+        # Extract the package name (usually the second argument after -y)
+        package = ""
+        remaining_args = []
+        
+        for i, arg in enumerate(args):
+            if arg == "-y" and i+1 < len(args):
+                package = args[i+1]
+                remaining_args = args[i+2:] if i+2 < len(args) else []
+                break
+        
+        if not package:
+            logger.warning(f"Could not find package name in args for '{server_id}'")
+            return
+        
+        # Use the existing Node.js runner for npx packages
+        server_config = {
+            "package": package,
+            "env": env_vars,
+            "args": remaining_args
+        }
+        
+        node_script_path = NODE_RUNNER_PATH
+        if not node_script_path:
+            node_script_path = create_node_runner()
+        
+        # Start the Node.js runner process
+        process_env = os.environ.copy()
+        process_env.update({"PORT": str(server_port)})
+        process_env.update(env_vars)
+        
+        process = subprocess.Popen(
+            ["node", node_script_path, json.dumps(server_config)],
+            env=process_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+    else:
+        # For other commands, spawn process directly
+        process_env = os.environ.copy()
+        process_env.update(env_vars)
+        
+        cmd = [command] + args
+        process = subprocess.Popen(
+            cmd,
+            env=process_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+    
+    # Store information about the server
+    mcp_processes[server_id] = {
+        "process": process,
+        "port": server_port,
+        "command": command,
+        "args": args,
+        "env": env_vars
+    }
+    
+    # Configure the server in our registry
+    mcp_servers[server_id] = MCPConfig(
+        server_url=f"http://localhost:{server_port}"
+    )
+    
+    # Start a thread to monitor the process output
+    def monitor_output():
+        for line in process.stdout:
+            print(f"[{server_id}] {line.strip()}")
+    
+    threading.Thread(target=monitor_output, daemon=True).start()
+    
+    return server_port
+
 # Find a free port to use
 def find_free_port(start_port, end_port):
     import socket
+    
+    # Avoid reusing ports that are already allocated
     for port in range(start_port, end_port + 1):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            result = sock.connect_ex(('localhost', port))
-            if result != 0:  # Port is available
+        if port in used_ports:
+            continue
+            
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(('', port))
+                used_ports.add(port)  # Mark this port as used
                 return port
-    raise RuntimeError("No free ports available")
+            except OSError:
+                continue
+    
+    return None
 
 # Clean up processes on shutdown
 def cleanup_processes():
     logger.info("Cleaning up MCP server processes...")
     for server_id, info in mcp_processes.items():
-        logger.info(f"Stopping MCP server '{server_id}'")
         try:
-            info["process"].terminate()
-            info["process"].wait(timeout=5)
+            if "process" in info and info["process"].poll() is None:
+                logger.info(f"Stopping MCP server '{server_id}'")
+                info["process"].terminate()
+                info["process"].wait(timeout=5)
         except Exception as e:
             logger.error(f"Error stopping MCP server '{server_id}': {str(e)}")
-            try:
-                info["process"].kill()
-            except:
-                pass
+    
+    # Clear the used ports set
+    used_ports.clear()
 
 atexit.register(cleanup_processes)
 
@@ -286,55 +425,20 @@ atexit.register(cleanup_processes)
 signal.signal(signal.SIGINT, lambda sig, frame: (cleanup_processes(), exit(0)))
 signal.signal(signal.SIGTERM, lambda sig, frame: (cleanup_processes(), exit(0)))
 
-# Routes
-@app.post("/configure")
-async def configure_mcp_server(
-    server_id: str, 
-    config: MCPConfig,
-    api_key: str = Depends(verify_api_key)
-):
-    """Configure an external MCP server connection"""
-    mcp_servers[server_id] = config
-    return {"status": "success", "message": f"MCP server {server_id} configured successfully"}
+# API Endpoints
 
-@app.post("/configure-local")
-async def configure_local_mcp_server(
-    server_id: str,
-    definition: MCPServerDefinition,
-    api_key: str = Depends(verify_api_key)
-):
-    """Configure and start a local MCP server from an npm package"""
-    if server_id in mcp_processes:
-        # Server already running, stop it first
-        try:
-            info = mcp_processes[server_id]
-            info["process"].terminate()
-            info["process"].wait(timeout=5)
-        except Exception as e:
-            logger.error(f"Error stopping existing MCP server '{server_id}': {str(e)}")
-    
-    # Start the new server
-    try:
-        port = start_mcp_server(server_id, definition)
-        return {
-            "status": "success",
-            "message": f"MCP server {server_id} started successfully",
-            "port": port,
-            "url": f"http://localhost:{port}"
-        }
-    except Exception as e:
-        logger.error(f"Error starting MCP server '{server_id}': {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error starting MCP server: {str(e)}"
-        )
-
-@app.get("/servers")
+@app.get("/servers", tags=["MCP Server Management"])
 async def list_servers(api_key: str = Depends(verify_api_key)):
-    """List all configured MCP servers"""
+    """
+    List all configured MCP servers.
+    
+    Returns:
+    - local_servers: List of MCP servers running locally
+    - external_servers: List of external MCP servers configured
+    """
     result = {
-        "external_servers": [],
-        "local_servers": []
+        "local_servers": [],
+        "external_servers": []
     }
     
     for server_id, config in mcp_servers.items():
@@ -343,10 +447,11 @@ async def list_servers(api_key: str = Depends(verify_api_key)):
             info = mcp_processes[server_id]
             result["local_servers"].append({
                 "id": server_id,
-                "package": info["definition"]["package"],
-                "url": info["url"],
+                "package": info.get("definition", {}).get("package", ""),
+                "url": info.get("url", ""),
+                "port": info.get("port", 0),
                 "running": info["process"].poll() is None,
-                "started_at": info["started_at"]
+                "started_at": info.get("started_at", 0)
             })
         else:
             # This is an external server
@@ -357,156 +462,263 @@ async def list_servers(api_key: str = Depends(verify_api_key)):
     
     return result
 
-@app.post("/call/{server_id}")
+@app.post("/call/{server_id}", tags=["MCP Operations"])
 async def call_mcp_server(
     server_id: str,
     request_body: Dict[str, Any] = Body(...),
     api_key: str = Depends(verify_api_key)
 ):
-    """Call an MCP server with the provided request body"""
+    """
+    Call an MCP server with the provided request body.
+    
+    The request body should follow the MCP specification and include:
+    - messages: List of message objects
+    - tool_calls: List of tool call objects
+    
+    Parameters:
+    - server_id: ID of the MCP server to call
+    
+    Returns:
+    The response from the MCP server
+    """
     if server_id not in mcp_servers:
         raise HTTPException(
             status_code=404,
-            detail=f"MCP server {server_id} not found. Please configure it first."
+            detail=f"MCP server '{server_id}' not found",
         )
     
     server_config = mcp_servers[server_id]
+    server_url = server_config.server_url
     
-    # Prepare headers
     headers = {
         "Content-Type": "application/json"
     }
     
-    # Add API key if provided in config
     if server_config.api_key:
-        headers["Authorization"] = f"Bearer {server_config.api_key}"
+        headers["X-API-Key"] = server_config.api_key
     
-    # Add any additional headers from config
     if server_config.headers:
         headers.update(server_config.headers)
     
     try:
-        logger.info(f"Sending request to MCP server {server_id}")
         response = requests.post(
-            server_config.server_url,
+            f"{server_url}/v1",
             json=request_body,
             headers=headers
         )
         
-        # Log response status
-        logger.info(f"MCP server responded with status {response.status_code}")
-        
-        # Check if response is successful
-        response.raise_for_status()
-        
-        # Return the response from the MCP server
         return response.json()
-    
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error calling MCP server: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error calling MCP server '{server_id}': {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error calling MCP server: {str(e)}"
+            detail=f"Error calling MCP server: {str(e)}",
         )
 
-@app.post("/tool-call/{server_id}")
+@app.post("/tool-call/{server_id}", tags=["MCP Operations"])
 async def make_tool_call(
     server_id: str,
     tool_call: MCPToolCall,
     api_key: str = Depends(verify_api_key)
 ):
-    """Make a single tool call to an MCP server"""
+    """
+    Make a single tool call to an MCP server.
+    
+    This is a simplified version of the /call endpoint that only requires
+    a single tool call object instead of a full MCP request.
+    
+    Parameters:
+    - server_id: ID of the MCP server to call
+    - tool_call: A single MCPToolCall object containing:
+      - tool_name: Name of the tool to call
+      - tool_args: Arguments for the tool
+      - tool_call_id: Unique ID for the tool call
+      
+    Returns:
+    The tool response from the MCP server
+    """
     if server_id not in mcp_servers:
         raise HTTPException(
             status_code=404,
-            detail=f"MCP server {server_id} not found. Please configure it first."
+            detail=f"MCP server '{server_id}' not found",
         )
     
     server_config = mcp_servers[server_id]
+    server_url = server_config.server_url
+    
+    # Prepare the MCP request
+    mcp_request = {
+        "messages": [],
+        "tool_calls": [
+            {
+                "tool_name": tool_call.tool_name,
+                "tool_args": tool_call.tool_args,
+                "tool_call_id": tool_call.tool_call_id or str(uuid.uuid4())
+            }
+        ]
+    }
     
     # Prepare headers
     headers = {
         "Content-Type": "application/json"
     }
     
-    # Add API key if provided in config
     if server_config.api_key:
-        headers["Authorization"] = f"Bearer {server_config.api_key}"
+        headers["X-API-Key"] = server_config.api_key
     
-    # Add any additional headers from config
     if server_config.headers:
         headers.update(server_config.headers)
     
-    # Construct MCP request for a tool call
-    mcp_request = {
-        "tool_calls": [
-            {
-                "tool_name": tool_call.tool_name,
-                "tool_args": tool_call.tool_args,
-                "tool_call_id": tool_call.tool_call_id
-            }
-        ]
-    }
-    
     try:
-        logger.info(f"Making tool call {tool_call.tool_name} to MCP server {server_id}")
+        # Make the request to the MCP server
         response = requests.post(
-            server_config.server_url,
+            f"{server_url}/v1",
             json=mcp_request,
             headers=headers
         )
         
-        # Log response status
-        logger.info(f"MCP server responded with status {response.status_code}")
+        response_data = response.json()
         
-        # Check if response is successful
-        response.raise_for_status()
+        # Extract the tool response
+        if "tool_responses" in response_data:
+            for tool_response in response_data["tool_responses"]:
+                if tool_response["tool_call_id"] == tool_call.tool_call_id:
+                    return {
+                        "tool_call_id": tool_response["tool_call_id"],
+                        "response": tool_response["response"]
+                    }
         
-        # Return the response from the MCP server
-        return response.json()
-    
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error making tool call: {str(e)}")
+        # Return the full response if the specific tool response can't be found
+        return response_data
+    except Exception as e:
+        logger.error(f"Error making tool call to MCP server '{server_id}': {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error making tool call: {str(e)}"
+            detail=f"Error making tool call: {str(e)}",
         )
 
-@app.delete("/servers/{server_id}")
-async def delete_server(
+@app.get("/server/{server_id}/tools", tags=["MCP Operations"])
+async def discover_tools(
     server_id: str,
     api_key: str = Depends(verify_api_key)
 ):
-    """Delete an MCP server configuration and stop it if it's running locally"""
+    """
+    Discover the tools available from an MCP server.
+    
+    This endpoint follows the Model Context Protocol specification for tool discovery.
+    It sends a discovery request to the MCP server and returns the available tools
+    and their schemas.
+    
+    Parameters:
+    - server_id: ID of the MCP server to discover tools from
+    
+    Returns:
+    A list of available tools and their schemas from the MCP server
+    """
     if server_id not in mcp_servers:
         raise HTTPException(
             status_code=404,
-            detail=f"MCP server {server_id} not found"
+            detail=f"MCP server '{server_id}' not found",
         )
     
-    # If it's a local server, stop it
-    if server_id in mcp_processes:
-        try:
-            info = mcp_processes[server_id]
-            info["process"].terminate()
-            info["process"].wait(timeout=5)
-            del mcp_processes[server_id]
-        except Exception as e:
-            logger.error(f"Error stopping MCP server '{server_id}': {str(e)}")
+    server_config = mcp_servers[server_id]
+    server_url = server_config.server_url
     
-    # Remove the configuration
-    del mcp_servers[server_id]
+    # Prepare the discovery request following MCP specification
+    discovery_request = {
+        "messages": [],
+        "tool_calls": [
+            {
+                "tool_name": "__describe_tools",
+                "tool_args": {},
+                "tool_call_id": str(uuid.uuid4())
+            }
+        ]
+    }
     
-    return {"status": "success", "message": f"MCP server {server_id} deleted successfully"}
+    # Prepare headers
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    if server_config.api_key:
+        headers["X-API-Key"] = server_config.api_key
+    
+    if server_config.headers:
+        headers.update(server_config.headers)
+    
+    try:
+        # Make the request to the MCP server
+        response = requests.post(
+            f"{server_url}/v1",
+            json=discovery_request,
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            response_data = response.json()
+            
+            # Check if we got a proper tool response
+            if "tool_responses" in response_data:
+                for tool_response in response_data["tool_responses"]:
+                    # Return the first tool response we find
+                    return {
+                        "status": "success",
+                        "tools": tool_response.get("response", {}).get("tools", [])
+                    }
+            
+            # If we didn't get a tool response, return the full response
+            return {
+                "status": "success",
+                "raw_response": response_data
+            }
+        else:
+            # Server doesn't support tool discovery
+            # Return a predefined list of tools for known servers as fallback
+            known_tools = {
+                "todoist": [
+                    {"name": "get_tasks", "description": "Get a list of tasks from Todoist"},
+                    {"name": "create_task", "description": "Create a new task in Todoist"}
+                ],
+                "memory": [
+                    {"name": "create", "description": "Create a new memory entry"},
+                    {"name": "query", "description": "Query existing memories"}
+                ],
+                "slack": [
+                    {"name": "get_channels", "description": "Get a list of channels from Slack"},
+                    {"name": "post_message", "description": "Post a message to a Slack channel"}
+                ],
+                "brave-search": [
+                    {"name": "search", "description": "Search the web using Brave Search"}
+                ]
+            }
+            
+            return {
+                "status": "partial",
+                "message": "Server does not support tool discovery. Using predefined tools.",
+                "tools": known_tools.get(server_id, [])
+            }
+    except Exception as e:
+        logger.error(f"Error discovering tools for MCP server '{server_id}': {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error discovering tools: {str(e)}",
+        )
 
-@app.get("/health")
+@app.get("/health", tags=["System"])
 async def health_check():
-    """Check if the service is running"""
+    """
+    Check if the service is running.
+    
+    Returns:
+    - status: Current health status of the service
+    - servers: Information about configured servers
+    """
     return {
         "status": "healthy",
         "servers": {
             "total": len(mcp_servers),
-            "local_running": sum(1 for info in mcp_processes.values() if info["process"].poll() is None)
+            "local_running": sum(1 for server_id in mcp_processes if mcp_processes[server_id]["process"].poll() is None)
         }
     }
 
@@ -515,31 +727,46 @@ NODE_RUNNER_PATH = create_node_runner()
 
 # Start pre-configured MCP servers
 async def start_preconfigured_servers():
-    # Define the servers you want to pre-configure
-    preconfigured_servers = {
-        "todoist": MCPServerDefinition(
-            package="@abhiz123/todoist-mcp-server",
-            env={}  # You'll need to add TODOIST_API_TOKEN in production
-        ),
-        "fetch": MCPServerDefinition(
-            package="@modelcontextprotocol/server-fetch"
-        ),
-        "slack": MCPServerDefinition(
-            package="@modelcontextprotocol/server-slack",
-            env={}  # You'll need to add SLACK_TOKEN in production
-        ),
-        "memory": MCPServerDefinition(
-            package="@modelcontextprotocol/server-memory"
-        )
-    }
+    # Load server configurations from JSON file
+    server_configs = load_server_configs()
     
-    # Start each preconfigured server
-    for server_id, definition in preconfigured_servers.items():
+    if not server_configs or "mcpServers" not in server_configs:
+        logger.warning("No server configurations found in configuration file")
+        # Fall back to default servers if no configurations found
+        preconfigured_servers = {
+            "todoist": MCPServerDefinition(
+                package="@abhiz123/todoist-mcp-server",
+                env={}
+            ),
+            "fetch": MCPServerDefinition(
+                package="@modelcontextprotocol/server-fetch"
+            ),
+            "slack": MCPServerDefinition(
+                package="@modelcontextprotocol/server-slack",
+                env={}
+            ),
+            "memory": MCPServerDefinition(
+                package="@modelcontextprotocol/server-memory"
+            )
+        }
+        
+        # Start each preconfigured server using the old method
+        for server_id, definition in preconfigured_servers.items():
+            try:
+                logger.info(f"Starting preconfigured MCP server: {server_id}")
+                start_mcp_server(server_id, definition)
+            except Exception as e:
+                logger.error(f"Failed to start preconfigured server '{server_id}': {str(e)}")
+        
+        return
+    
+    # Start each configured server using the Claude Desktop format
+    for server_id, config in server_configs["mcpServers"].items():
         try:
-            logger.info(f"Starting preconfigured MCP server: {server_id}")
-            start_mcp_server(server_id, definition)
+            logger.info(f"Starting configured MCP server: {server_id}")
+            start_server_claude_format(server_id, config)
         except Exception as e:
-            logger.error(f"Failed to start preconfigured server '{server_id}': {str(e)}")
+            logger.error(f"Failed to start configured server '{server_id}': {str(e)}")
 
 # Main entry point
 if __name__ == "__main__":
