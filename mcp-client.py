@@ -541,6 +541,96 @@ async def list_server_tools(server_id: str, api_key: str = Depends(verify_api_ke
             detail=f"Error listing tools: {str(e)}"
         )
 
+@app.post("/servers/{server_id}/tools/{tool_name}", tags=["MCP Server Tools"])
+async def call_server_tool(
+    server_id: str, 
+    tool_name: str, 
+    tool_args: Dict[str, Any], 
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Call a tool on an MCP server with the provided arguments.
+    """
+    try:
+        # Check if the server exists in configuration
+        if server_id not in server_configs["mcpServers"]:
+            logger.error(f"Server {server_id} not found in configuration")
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Server {server_id} not found"
+            )
+        
+        # Get the server configuration
+        server_config = server_configs["mcpServers"][server_id]
+        
+        # Extract command and args
+        cmd = server_config.get("command", "npx")
+        args = server_config.get("args", [])
+        
+        # Prepare environment variables
+        env = {}
+        for key, value in server_config.get("env", {}).items():
+            # Handle environment variable references
+            if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+                env_var_name = value[2:-1]
+                env_var_value = os.getenv(env_var_name)
+                if env_var_value:
+                    env[key] = env_var_value
+                else:
+                    logger.warning(f"Environment variable {env_var_name} not found for server {server_id}")
+            else:
+                env[key] = value
+        
+        # Create server parameters
+        server_params = StdioServerParameters(
+            command=cmd,
+            args=args,
+            env=env
+        )
+        
+        # Set a timeout for the entire operation
+        try:
+            async with asyncio.timeout(30.0):  # 30 second timeout for tool calls
+                # Follow the example pattern exactly
+                logger.info(f"Creating new process for {server_id} to call tool {tool_name}")
+                async with stdio_client(server_params) as (read, write):
+                    logger.info(f"Created stdio client for {server_id}, initializing session")
+                    async with ClientSession(read, write) as session:
+                        # Initialize the session
+                        logger.info(f"Initializing session for {server_id}")
+                        await session.initialize()
+                        
+                        # Call the tool with the session
+                        logger.info(f"Calling tool {tool_name} on server {server_id} with args: {tool_args}")
+                        tool_response = await session.call_tool(tool_name, tool_args)
+                        
+                        # Process the response
+                        response_content = []
+                        for content_item in tool_response.content:
+                            if hasattr(content_item, "text") and content_item.text:
+                                response_content.append({"type": "text", "text": content_item.text})
+                            elif hasattr(content_item, "json") and content_item.json:
+                                response_content.append({"type": "json", "json": content_item.json})
+                        
+                        return {
+                            "tool": tool_name,
+                            "content": response_content
+                        }
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout while calling tool {tool_name} on server {server_id}")
+            raise HTTPException(
+                status_code=504, 
+                detail="Timeout while communicating with the MCP server"
+            )
+    except Exception as e:
+        logger.error(f"Error calling tool {tool_name} on server {server_id}: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error calling tool: {str(e)}"
+        )
+
 @app.post("/servers/{server_id}/tool-call", response_model=Dict[str, Any])
 async def call_tool(
     server_id: str,
