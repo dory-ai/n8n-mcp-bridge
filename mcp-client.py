@@ -1,41 +1,45 @@
 import os
 import json
-import logging
-import subprocess
 import time
-import signal
-import atexit
 import uuid
 import asyncio
+import subprocess
+import threading
+import logging
+import signal
+import atexit
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, HTTPException, Depends, Header, Body, Request
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from dotenv import load_dotenv
-import threading
 from contextlib import asynccontextmanager
 
 # Import the MCP SDK
-from mcp.client.sse import sse_client
-from mcp.client.session import ClientSession
-import mcp.types as mcp_types
-
-# Try to get the version - handle case where it's not available
 try:
-    from mcp import __version__ as mcp_version
+    from mcp.client.session import ClientSession
+    from mcp.client.sse import sse_client
+    from mcp.client.stdio import stdio_client
+    from mcp import StdioServerParameters
 except ImportError:
-    mcp_version = "unknown"
+    logger = logging.getLogger('mcp_client')
+    logger.warning("MCP SDK not found, installing...")
+    subprocess.run(["pip", "install", "mcp"], check=True)
+    from mcp.client.session import ClientSession
+    from mcp.client.sse import sse_client
+    from mcp.client.stdio import stdio_client
+    from mcp import StdioServerParameters
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+)
+logger = logging.getLogger('mcp_client')
 
 # Load environment variables
 load_dotenv()
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger("mcp_client")
 
 # Load server configurations from JSON file
 def load_server_configs():
@@ -97,14 +101,11 @@ class MCPServerDefinition(BaseModel):
     env: Optional[Dict[str, str]] = None
     args: Optional[List[str]] = None
 
-# Store running MCP server processes and connection info
-mcp_processes: Dict[str, Dict[str, Any]] = {}
-
-# Store MCP client session cache
-mcp_sessions: Dict[str, Any] = {}
-
-# Track used ports to avoid conflicts
-used_ports = set()
+# Global state
+mcp_processes = {}  # Store running MCP server processes
+mcp_sessions = {}   # Store active MCP client sessions
+used_ports = set()  # Track used ports for MCP servers
+server_configs = load_server_configs()  # Load server configurations
 
 # Find a free port to use
 def find_free_port(start_port, end_port):
@@ -123,92 +124,98 @@ def find_free_port(start_port, end_port):
     
     return None
 
+# Get the next available port
+def get_next_available_port():
+    port = 3000
+    while port in used_ports:
+        port += 1
+    used_ports.add(port)
+    return port
+
 # Start an MCP server as an NPX process
 def start_mcp_server(server_id: str, server_config: Dict[str, Any]):
-    if server_id in mcp_processes and mcp_processes[server_id].get("process") and \
-       mcp_processes[server_id].get("process").poll() is None:
-        logger.info(f"MCP server {server_id} is already running")
-        return mcp_processes[server_id]
-    
-    # Find a free port for the server
-    port = find_free_port(3000, 4000)
-    if not port:
-        logger.error("Failed to find a free port")
-        return None
-    
-    used_ports.add(port)
-    
-    # Get the package name and command
-    package = server_config.get("package")
-    command = server_config.get("command", "npx")
-    args = server_config.get("args", [])
-    
-    if not package and not (command and args):
-        logger.error(f"Invalid server configuration for {server_id}: missing package or command")
-        return None
-    
-    # Prepare the command
-    if command == "npx":
-        cmd = ["npx", "-y"]
-        if package:
-            cmd.append(package)
-        elif args:
-            cmd.extend(args[1:]) # Skip the '-y' that's already in cmd
-    else:
-        cmd = [command]
-        if args:
-            cmd.extend(args)
-    
-    # Prepare environment variables
-    env_dict = dict(os.environ)
-    env_dict["PORT"] = str(port)
-    
-    # Handle environment variable templates in the config
-    if "env" in server_config:
-        for env_name, env_value in server_config["env"].items():
-            if isinstance(env_value, str) and env_value.startswith("${") and env_value.endswith("}"):
-                # It's a template, get the value from environment
-                env_var_name = env_value[2:-1]
-                actual_value = os.environ.get(env_var_name)
-                if actual_value:
-                    env_dict[env_name] = actual_value
-                else:
-                    logger.warning(f"Environment variable {env_var_name} not found for {env_name}")
-            else:
-                env_dict[env_name] = env_value
-    
-    # Start the process
+    """
+    Start an MCP server process.
+    Returns process information if successful, None otherwise.
+    """
     try:
+        # Create logs directory if it doesn't exist
+        if not os.path.exists("logs"):
+            os.makedirs("logs")
+        
+        # Prepare command
+        cmd = [server_config["command"]]
+        cmd.extend(server_config.get("args", []))
+        
+        # Let the server use its default transport mode (stdio)
+        # We'll handle both stdio and HTTP with the appropriate client
+        
+        # Add port flag to specify a unique port (for HTTP mode if used)
+        port = get_next_available_port()
+        
+        # Set up environment variables
+        env = os.environ.copy()
+        for key, value in server_config.get("env", {}).items():
+            # Handle environment variable references
+            if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+                env_var_name = value[2:-1]
+                env_var_value = os.getenv(env_var_name)
+                if env_var_value:
+                    logger.info(f"Set environment variable {key} for server {server_id}")
+                    env[key] = env_var_value
+                else:
+                    logger.warning(f"Environment variable {env_var_name} not found for {key}")
+            else:
+                env[key] = value
+        
+        # Open log files
+        stdout_log = open(f"logs/{server_id}_stdout.log", "w")
+        stderr_log = open(f"logs/{server_id}_stderr.log", "w")
+        
+        # Start the process
+        logger.info(f"Starting MCP server {server_id} with command: {' '.join(cmd)}")
         process = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env_dict
+            env=env,
+            stdout=subprocess.PIPE,  # Use PIPE to keep stdout accessible for stdio communication
+            stderr=stderr_log,
+            stdin=subprocess.PIPE,   # Use PIPE to keep stdin accessible for stdio communication
+            text=True,
+            bufsize=1  # Line buffered
         )
         
-        logger.info(f"Started MCP server {server_id} (PID: {process.pid}) on port {port}")
+        # Create a thread to log stdout without consuming it
+        def log_stdout():
+            """Log stdout to file without consuming the pipe"""
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    break
+                stdout_log.write(line)
+                stdout_log.flush()
         
-        # Store process info
-        process_info = {
+        # Start the logging thread
+        stdout_thread = threading.Thread(target=log_stdout, daemon=True)
+        stdout_thread.start()
+        
+        # Store process information
+        mcp_processes[server_id] = {
             "process": process,
-            "port": port,
-            "pid": process.pid,
-            "started_at": time.time(),
             "running": True,
-            "url": f"http://localhost:{port}/v1",
-            "config": server_config
+            "port": port,
+            "stdout_log": stdout_log,
+            "stderr_log": stderr_log,
+            "stdout_thread": stdout_thread,
+            "started_at": time.time()
         }
         
-        mcp_processes[server_id] = process_info
+        # Wait for server to start
+        logger.info(f"Started MCP server {server_id} (PID: {process.pid}) on port {port}")
+        time.sleep(3)  # Give the server time to start
         
-        # Give the server a moment to start
-        time.sleep(1)
-        
-        return process_info
+        return mcp_processes[server_id]
     except Exception as e:
-        logger.error(f"Error starting MCP server {server_id}: {str(e)}")
-        if port in used_ports:
-            used_ports.remove(port)
+        logger.error(f"Failed to start MCP server {server_id}: {str(e)}")
         return None
 
 # Stop an MCP server process
@@ -240,6 +247,19 @@ def stop_mcp_server(server_id: str):
         if server_id in mcp_sessions:
             del mcp_sessions[server_id]
         
+        # Close log files
+        if "stdout_log" in process_info and process_info["stdout_log"]:
+            try:
+                process_info["stdout_log"].close()
+            except Exception as e:
+                logger.warning(f"Error closing stdout file for server {server_id}: {str(e)}")
+        
+        if "stderr_log" in process_info and process_info["stderr_log"]:
+            try:
+                process_info["stderr_log"].close()
+            except Exception as e:
+                logger.warning(f"Error closing stderr file for server {server_id}: {str(e)}")
+        
         # Update the process info
         process_info["running"] = False
         
@@ -261,10 +281,30 @@ def cleanup_processes():
             logger.info(f"Terminating MCP server {server_id} (PID: {process.pid})")
             try:
                 process.terminate()
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                logger.warning(f"MCP server {server_id} did not terminate, killing...")
-                process.kill()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"MCP server {server_id} did not terminate, killing...")
+                    process.kill()
+                
+                # Close log files
+                if "stdout_log" in info and info["stdout_log"]:
+                    try:
+                        info["stdout_log"].close()
+                        logger.debug(f"Closed stdout file for server {server_id}")
+                    except:
+                        pass
+                
+                if "stderr_log" in info and info["stderr_log"]:
+                    try:
+                        info["stderr_log"].close()
+                        logger.debug(f"Closed stderr file for server {server_id}")
+                    except:
+                        pass
+                
+            except Exception as e:
+                logger.error(f"Error cleaning up server {server_id}: {str(e)}")
+            
             info["running"] = False
 
 atexit.register(cleanup_processes)
@@ -275,7 +315,6 @@ signal.signal(signal.SIGTERM, lambda sig, frame: (cleanup_processes(), exit(0)))
 
 # Start all configured servers on startup
 def start_configured_servers():
-    server_configs = load_server_configs()
     for server_id, config in server_configs.get("mcpServers", {}).items():
         logger.info(f"Starting configured MCP server: {server_id}")
         start_mcp_server(server_id, config)
@@ -284,73 +323,97 @@ def start_configured_servers():
 async def get_mcp_client_session(server_id: str):
     """
     Get or create an MCP client session for a server.
-    Uses the SSE transport to communicate with the MCP server.
+    Returns a session if successful, None otherwise.
     """
-    # Check if we already have a cached session
-    if server_id in mcp_sessions and mcp_sessions[server_id].get("valid", False):
-        return mcp_sessions[server_id]["session"]
-    
-    # Check if server exists in our configuration
-    server_configs = load_server_configs()
-    if "mcpServers" not in server_configs or server_id not in server_configs["mcpServers"]:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Server configuration for {server_id} not found"
-        )
-    
-    # Start the server if it's not already running
-    if server_id not in mcp_processes or not mcp_processes[server_id].get("running", False):
-        server_config = server_configs["mcpServers"][server_id]
-        process_info = start_mcp_server(server_id, server_config)
-        if not process_info:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to start server {server_id}"
-            )
-    
-    # Get server URL
-    process_info = mcp_processes[server_id]
-    server_url = process_info.get("url")
-    
-    if not server_url:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Server {server_id} URL not available"
-        )
-    
-    # Create a new session using the SSE transport
     try:
-        logger.info(f"Creating new MCP client session for server {server_id} at {server_url}")
+        # Check if we already have a valid session
+        if server_id in mcp_sessions and mcp_sessions[server_id].get("valid", False):
+            logger.info(f"Using existing MCP client session for server {server_id}")
+            return mcp_sessions[server_id]["session"]
         
-        # Create session with the SSE client
-        read_stream, write_stream = await asyncio.to_thread(
-            lambda: asyncio.run(sse_client_wrapper(server_url))
-        )
+        # Check if the server is running
+        if server_id not in mcp_processes or not mcp_processes[server_id].get("running", False):
+            # Try to start the server
+            logger.info(f"Server {server_id} not running, attempting to start")
+            if server_id not in server_configs["mcpServers"]:
+                logger.error(f"Server {server_id} not found in configuration")
+                return None
+            
+            server_config = server_configs["mcpServers"][server_id]
+            process_info = start_mcp_server(server_id, server_config)
+            
+            if not process_info:
+                logger.error(f"Failed to start server {server_id}")
+                return None
         
-        session = ClientSession(read_stream, write_stream)
-        
-        # Initialize the session
-        await session.initialize()
-        
-        # Cache the session
-        mcp_sessions[server_id] = {
-            "session": session,
-            "valid": True,
-            "created_at": time.time()
-        }
-        
-        return session
+        # Instead of trying to communicate with the existing process,
+        # let's start a fresh process using the MCP SDK's stdio_client
+        try:
+            logger.info(f"Creating new MCP client session for server {server_id}")
+            
+            # Get the server configuration
+            server_config = server_configs["mcpServers"][server_id]
+            cmd = server_config.get("command", "").split()
+            args = server_config.get("args", [])
+            
+            # Prepare environment variables
+            env = {}
+            for key, value in server_config.get("env", {}).items():
+                # Handle environment variable references
+                if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+                    env_var_name = value[2:-1]
+                    env_var_value = os.getenv(env_var_name)
+                    if env_var_value:
+                        env[key] = env_var_value
+                    else:
+                        logger.warning(f"Environment variable {env_var_name} not found for {key}")
+                else:
+                    env[key] = value
+            
+            # Create server parameters for a new process
+            server_params = StdioServerParameters(
+                command=cmd[0],
+                args=args,
+                env=env
+            )
+            
+            # Use the stdio_client as a context manager to create a new process
+            # and properly handle the communication
+            logger.info(f"Starting new process for {server_id} with stdio_client")
+            
+            # Create a new process and session
+            async def create_and_initialize_session():
+                async with stdio_client(server_params) as (read, write):
+                    session = ClientSession(read, write)
+                    await session.initialize()
+                    return session
+            
+            # Set a timeout for initialization
+            try:
+                async with asyncio.timeout(5.0):  # 5 second timeout for initialization
+                    session = await create_and_initialize_session()
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout initializing session for {server_id}")
+                raise Exception(f"Timeout initializing session for {server_id}")
+            
+            # Store the session
+            mcp_sessions[server_id] = {
+                "session": session,
+                "valid": True,
+                "timestamp": time.time()
+            }
+            
+            return session
+        except Exception as e:
+            logger.error(f"Failed to create stdio session for {server_id}: {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return None
     except Exception as e:
-        logger.error(f"Error creating MCP client session for server {server_id}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error connecting to MCP server: {str(e)}"
-        )
-
-# Helper to run sse_client in a synchronous context
-async def sse_client_wrapper(url):
-    async with sse_client(url) as (read_stream, write_stream):
-        return read_stream, write_stream
+        import traceback
+        logger.error(f"Failed to create MCP client session: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return None
 
 # API endpoints
 @app.get("/servers", response_model=Dict[str, Any])
@@ -359,7 +422,6 @@ async def list_servers(api_key: str = Depends(verify_api_key)):
     List all configured MCP servers.
     This endpoint returns information about all servers defined in the servers.json file.
     """
-    server_configs = load_server_configs()
     server_list = []
     
     for server_id, config in server_configs.get("mcpServers", {}).items():
@@ -385,39 +447,97 @@ async def list_servers(api_key: str = Depends(verify_api_key)):
     
     return {
         "servers": server_list,
-        "mcp_sdk_version": mcp_version
+        "mcp_sdk_version": "unknown"
     }
 
-@app.get("/servers/{server_id}/tools", response_model=List[Dict[str, Any]])
-async def list_tools(
-    server_id: str,
-    api_key: str = Depends(verify_api_key)
-):
+@app.get("/servers/{server_id}/tools", tags=["MCP Server Tools"])
+async def list_server_tools(server_id: str, api_key: str = Depends(verify_api_key)):
     """
-    List the tools available from an MCP server.
-    Uses the MCP protocol to communicate with the server.
+    List available tools for an MCP server.
     """
     try:
-        session = await get_mcp_client_session(server_id)
+        # Check if the server exists in configuration
+        if server_id not in server_configs["mcpServers"]:
+            logger.error(f"Server {server_id} not found in configuration")
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Server {server_id} not found"
+            )
         
-        logger.info(f"Requesting tool list from MCP server {server_id}")
-        tools = await session.list_tools()
+        # Get the server configuration
+        server_config = server_configs["mcpServers"][server_id]
         
-        # Format the tools for external consumption
-        formatted_tools = []
-        for tool in tools:
-            formatted_tools.append({
-                "name": tool.get("name"),
-                "description": tool.get("description"),
-                "parameters": tool.get("parameters"),
-                "server_id": server_id
-            })
+        # Extract command and args
+        cmd = server_config.get("command", "npx")
+        args = server_config.get("args", [])
         
-        return formatted_tools
+        # Prepare environment variables
+        env = {}
+        for key, value in server_config.get("env", {}).items():
+            # Handle environment variable references
+            if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+                env_var_name = value[2:-1]
+                env_var_value = os.getenv(env_var_name)
+                if env_var_value:
+                    env[key] = env_var_value
+                else:
+                    logger.warning(f"Environment variable {env_var_name} not found for server {server_id}")
+            else:
+                env[key] = value
+        
+        # Create server parameters
+        server_params = StdioServerParameters(
+            command=cmd,
+            args=args,
+            env=env
+        )
+        
+        # Set a timeout for the entire operation
+        try:
+            async with asyncio.timeout(15.0):  # 15 second timeout
+                # Follow the example pattern exactly
+                logger.info(f"Creating new process for {server_id} with stdio_client")
+                async with stdio_client(server_params) as (read, write):
+                    logger.info(f"Created stdio client for {server_id}, initializing session")
+                    async with ClientSession(read, write) as session:
+                        # Initialize the session
+                        logger.info(f"Initializing session for {server_id}")
+                        await session.initialize()
+                        
+                        # List tools with the session
+                        logger.info(f"Listing tools for server {server_id}")
+                        tools_response = await session.list_tools()
+                        
+                        # Return the tools
+                        tools = []
+                        for tool in tools_response.tools:
+                            tool_info = {
+                                "name": tool.name,
+                                "description": tool.description
+                            }
+                            
+                            # Handle input schema based on its type
+                            if hasattr(tool, "input_schema") and tool.input_schema:
+                                if hasattr(tool.input_schema, "model_json_schema"):
+                                    tool_info["inputSchema"] = tool.input_schema.model_json_schema()
+                                else:
+                                    tool_info["inputSchema"] = tool.input_schema
+                            
+                            tools.append(tool_info)
+                        
+                        return {"tools": tools}
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout while listing tools for server {server_id}")
+            raise HTTPException(
+                status_code=504, 
+                detail="Timeout while communicating with the MCP server"
+            )
     except Exception as e:
-        logger.error(f"Error listing tools from MCP server {server_id}: {str(e)}")
+        logger.error(f"Error listing tools for server {server_id}: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(
-            status_code=500,
+            status_code=500, 
             detail=f"Error listing tools: {str(e)}"
         )
 
@@ -438,10 +558,9 @@ async def call_tool(
         call_id = tool_call.tool_call_id or str(uuid.uuid4())
         
         logger.info(f"Calling tool {tool_call.tool_name} on MCP server {server_id}")
-        result = await session.call_tool(
-            name=tool_call.tool_name,
-            arguments=tool_call.tool_args,
-            call_id=call_id
+        result = await session.invoke_tool(
+            tool_call.tool_name,
+            tool_call.tool_args
         )
         
         return {
@@ -462,7 +581,6 @@ async def health_check():
     """
     Check the health of the service.
     """
-    server_configs = load_server_configs()
     configured_count = len(server_configs.get("mcpServers", {}))
     
     # Count running servers
@@ -474,7 +592,7 @@ async def health_check():
     return {
         "status": "healthy",
         "version": "1.0.0",
-        "mcp_sdk_version": mcp_version,
+        "mcp_sdk_version": "unknown",
         "servers": {
             "configured": configured_count,
             "running": running_count
