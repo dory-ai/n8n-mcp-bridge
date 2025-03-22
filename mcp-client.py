@@ -523,6 +523,47 @@ async def list_server_tools(server_id: str, api_key: str = Depends(verify_api_ke
                                 else:
                                     tool_info["inputSchema"] = tool.input_schema
                             
+                            # If no input schema is provided, create a basic one based on the tool name
+                            # This is a fallback for servers that don't properly implement input schemas
+                            if "inputSchema" not in tool_info:
+                                # For brave_web_search, we know it needs a query parameter
+                                if tool.name == "brave_web_search":
+                                    tool_info["inputSchema"] = {
+                                        "type": "object",
+                                        "properties": {
+                                            "query": {
+                                                "type": "string",
+                                                "description": "The search query to use"
+                                            },
+                                            "count": {
+                                                "type": "integer",
+                                                "description": "Number of results to return (default: 10)",
+                                                "default": 10
+                                            },
+                                            "offset": {
+                                                "type": "integer",
+                                                "description": "Offset for pagination (default: 0)",
+                                                "default": 0
+                                            }
+                                        },
+                                        "required": ["query"]
+                                    }
+                                elif tool.name == "brave_local_search":
+                                    tool_info["inputSchema"] = {
+                                        "type": "object",
+                                        "properties": {
+                                            "query": {
+                                                "type": "string",
+                                                "description": "The search query for local businesses"
+                                            },
+                                            "location": {
+                                                "type": "string",
+                                                "description": "Location to search in (e.g., 'San Francisco, CA')"
+                                            }
+                                        },
+                                        "required": ["query", "location"]
+                                    }
+                            
                             tools.append(tool_info)
                         
                         return {"tools": tools}
