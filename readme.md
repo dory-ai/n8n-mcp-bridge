@@ -1,10 +1,10 @@
-# MCP Client Service for n8n Integration
+# n8n-mcp-bridge
 
-This service acts as a bridge between n8n and Model Context Protocol (MCP) servers. It enables n8n workflows to interact with MCP servers by providing a standardized HTTP API that handles the complexity of the MCP protocol behind the scenes.
+A lightweight bridge service that connects n8n workflows to Model Context Protocol (MCP) servers. This enables AI agents in n8n to seamlessly leverage specialized tools from MCP servers without requiring self-hosting of n8n.
 
 ## What this service does
 
-The MCP Client Service provides three core functionalities:
+The n8n-mcp-bridge provides three core functionalities:
 
 1. **List Available MCP Servers**: Returns a list of all configured MCP servers with their descriptions, allowing an AI agent in n8n to discover which specialized tools are available.
 
@@ -12,11 +12,29 @@ The MCP Client Service provides three core functionalities:
 
 3. **Execute Tool Calls**: Allows executing specific tools on an MCP server and returning the results, making external functionality available to n8n workflows.
 
+## Project Structure
+
+```
+/n8n-mcp-bridge/
+├── main.py                  # Entry point that starts the FastAPI application
+├── app/                     # Core application code
+│   ├── __init__.py          # Package initialization with version info
+│   ├── api.py               # FastAPI routes and endpoints
+│   ├── models.py            # Pydantic data models
+│   ├── server.py            # MCP server management
+│   └── session.py           # MCP session handling
+├── config/                  # Configuration files
+│   └── servers.json         # Server configurations
+├── logs/                    # Log directory (generated at runtime)
+├── requirements.txt         # Python dependencies
+└── README.md                # Documentation
+```
+
 ## How it works
 
 This service:
 
-1. **Spawns Local MCP Servers**: Automatically downloads and runs Node.js-based MCP servers locally using the configurations defined in `servers.json`.
+1. **Spawns Local MCP Servers**: Automatically downloads and runs Node.js-based MCP servers locally using the configurations defined in `config/servers.json`.
 
 2. **Translates HTTP to MCP Protocol**: Converts standard HTTP requests from n8n into the proper MCP protocol format.
 
@@ -37,7 +55,7 @@ This service comes pre-configured with the following MCP servers:
 
 ### MCP Server Configuration
 
-MCP servers are configured in the `servers.json` file with the following structure:
+MCP servers are configured in the `config/servers.json` file with the following structure:
 
 ```json
 {
@@ -58,7 +76,7 @@ MCP servers are configured in the `servers.json` file with the following structu
 Required environment variables are stored in the `.env` file:
 
 ```
-API_KEY=your-service-api-key
+X_API_KEY=your-service-api-key
 ALLOWED_ORIGINS=https://your-n8n-instance.example.com,http://localhost:5678
 BRAVE_API_KEY=your-brave-search-api-key
 SLACK_BOT_TOKEN=your-slack-bot-token
@@ -66,7 +84,7 @@ SLACK_TEAM_ID=your-slack-team-id
 TODOIST_API_TOKEN=your-todoist-api-token
 ```
 
-- `API_KEY`: Authentication key for accessing this service
+- `X_API_KEY`: Authentication key for accessing this service
 - `ALLOWED_ORIGINS`: Comma-separated list of domains allowed to make cross-origin requests to this service (required when deployed to production with n8n)
 - `BRAVE_API_KEY`: API key for Brave Search MCP server
 - `SLACK_BOT_TOKEN` & `SLACK_TEAM_ID`: Credentials for Slack MCP server
@@ -113,13 +131,13 @@ Simplified endpoint to execute a single tool call on the specified MCP server.
 3. Choose a name for your service
 4. Select "Python 3" as the runtime
 5. Set the build command: `pip install -r requirements.txt`
-6. Set the start command: `python mcp-client.py`
+6. Set the start command: `python main.py`
 
 ### 2. Set Environment Variables
 
 Add the following environment variables:
 
-- `API_KEY`: Your secure API key for authentication
+- `X_API_KEY`: Your secure API key for authentication
 - `NODE_VERSION`: `16` or higher (to ensure Node.js is available)
 - `NPM_CONFIG_PRODUCTION`: `false` (to ensure dev dependencies are installed)
 
@@ -165,13 +183,6 @@ In your n8n workflow, add an HTTP Request node with:
   }
   ```
 
-## Technical Implementation
-
-This service uses:
-- **FastAPI**: For the HTTP API layer
-- **MCP Python SDK**: For handling MCP protocol communication
-- **Node.js**: For spawning and managing local MCP servers
-
 ## Development
 
 ### Setting up the development environment
@@ -181,4 +192,4 @@ This service uses:
 3. Activate the virtual environment: `source venv/bin/activate` (Linux/Mac) or `venv\Scripts\activate` (Windows)
 4. Install dependencies: `pip install -r requirements.txt`
 5. Create a `.env` file with the necessary API keys
-6. Run the service: `python mcp-client.py`
+6. Run the service: `python main.py`

@@ -16,11 +16,12 @@ npm-debug.log
 yarn-debug.log
 yarn-error.log
 
-# MCP runtime files
-mcp_node_runner.js
-
 # IDE files
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# Logs and temporary files
+logs/
+temp/
