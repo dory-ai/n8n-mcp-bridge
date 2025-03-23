@@ -16,13 +16,8 @@ The n8n-mcp-bridge provides three core functionalities:
 
 ```
 /n8n-mcp-bridge/
-├── main.py                  # Entry point that starts the FastAPI application
-├── app/                     # Core application code
-│   ├── __init__.py          # Package initialization with version info
-│   ├── api.py               # FastAPI routes and endpoints
-│   ├── models.py            # Pydantic data models
-│   ├── server.py            # MCP server management
-│   └── session.py           # MCP session handling
+├── main.py                  # Main application file containing all functionality
+├── test_api.py              # Test script for API endpoints
 ├── config/                  # Configuration files
 │   └── servers.json         # Server configurations
 ├── logs/                    # Log directory (generated at runtime)
