@@ -517,52 +517,31 @@ async def list_server_tools(server_id: str, api_key: str = Depends(verify_api_ke
                             }
                             
                             # Handle input schema based on its type
+                            schema_found = False
+                            
+                            # Check for input_schema attribute (snake_case)
                             if hasattr(tool, "input_schema") and tool.input_schema:
                                 if hasattr(tool.input_schema, "model_json_schema"):
                                     tool_info["inputSchema"] = tool.input_schema.model_json_schema()
+                                    schema_found = True
                                 else:
                                     tool_info["inputSchema"] = tool.input_schema
+                                    schema_found = True
                             
-                            # If no input schema is provided, create a basic one based on the tool name
-                            # This is a fallback for servers that don't properly implement input schemas
-                            if "inputSchema" not in tool_info:
-                                # For brave_web_search, we know it needs a query parameter
-                                if tool.name == "brave_web_search":
-                                    tool_info["inputSchema"] = {
-                                        "type": "object",
-                                        "properties": {
-                                            "query": {
-                                                "type": "string",
-                                                "description": "The search query to use"
-                                            },
-                                            "count": {
-                                                "type": "integer",
-                                                "description": "Number of results to return (default: 10)",
-                                                "default": 10
-                                            },
-                                            "offset": {
-                                                "type": "integer",
-                                                "description": "Offset for pagination (default: 0)",
-                                                "default": 0
-                                            }
-                                        },
-                                        "required": ["query"]
-                                    }
-                                elif tool.name == "brave_local_search":
-                                    tool_info["inputSchema"] = {
-                                        "type": "object",
-                                        "properties": {
-                                            "query": {
-                                                "type": "string",
-                                                "description": "The search query for local businesses"
-                                            },
-                                            "location": {
-                                                "type": "string",
-                                                "description": "Location to search in (e.g., 'San Francisco, CA')"
-                                            }
-                                        },
-                                        "required": ["query", "location"]
-                                    }
+                            # Check for inputSchema attribute (camelCase) - used by Brave search server
+                            elif hasattr(tool, "inputSchema") and tool.inputSchema:
+                                tool_info["inputSchema"] = tool.inputSchema
+                                schema_found = True
+                            
+                            # If no schema is available, provide a standardized empty schema
+                            # This allows n8n to at least show the tool without breaking
+                            if not schema_found:
+                                logger.warning(f"Tool {tool.name} from server {server_id} does not provide an input schema")
+                                tool_info["inputSchema"] = {
+                                    "type": "object",
+                                    "properties": {},
+                                    "description": f"Schema not provided by the MCP server. Please refer to documentation for {tool.name}."
+                                }
                             
                             tools.append(tool_info)
                         
