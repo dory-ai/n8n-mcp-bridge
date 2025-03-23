@@ -43,7 +43,8 @@ load_dotenv()
 
 # Load server configurations from JSON file
 def load_server_configs():
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "servers.json")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(base_dir, "config", "servers.json")
     if os.path.exists(config_path):
         try:
             with open(config_path, "r") as f:
