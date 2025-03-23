@@ -19,6 +19,12 @@ yarn-error.log
 # MCP runtime files
 mcp_node_runner.js
 
+# Log files
+*.log
+logs/
+server_output.log
+temp/
+
 # IDE files
 .vscode/
 .idea/
