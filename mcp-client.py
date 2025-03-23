@@ -377,21 +377,36 @@ async def get_mcp_client_session(server_id: str):
                 env=env
             )
             
+            # Add the Node.js executable path to the environment variables for the server process
+            node_bin_path = os.path.dirname(cmd[0])  # Get directory containing npx
+            if 'PATH' in os.environ:
+                server_params.env['PATH'] = f"{node_bin_path}:{os.environ['PATH']}"
+            else:
+                server_params.env['PATH'] = node_bin_path
+            
+            logger.info(f"Set PATH for {server_id} to include Node.js bin directory: {node_bin_path}")
+            
             # Use the stdio_client as a context manager to create a new process
             # and properly handle the communication
             logger.info(f"Starting new process for {server_id} with stdio_client")
             
             # Create a new process and session
             async def create_and_initialize_session():
+                logger.info(f"Starting stdio_client for {server_id}")
                 async with stdio_client(server_params) as (read, write):
+                    logger.info(f"stdio_client started for {server_id}, creating session")
                     session = ClientSession(read, write)
+                    logger.info(f"Session created for {server_id}, initializing...")
                     await session.initialize()
+                    logger.info(f"Session initialized for {server_id}")
                     return session
             
             # Set a timeout for initialization
             try:
-                async with asyncio.timeout(5.0):  # 5 second timeout for initialization
+                logger.info(f"Setting timeout for {server_id} session initialization")
+                async with asyncio.timeout(15.0):  # 15 second timeout for initialization
                     session = await create_and_initialize_session()
+                logger.info(f"Session initialization completed for {server_id}")
             except asyncio.TimeoutError:
                 logger.error(f"Timeout initializing session for {server_id}")
                 raise Exception(f"Timeout initializing session for {server_id}")
@@ -491,6 +506,15 @@ async def list_server_tools(server_id: str, api_key: str = Depends(verify_api_ke
             args=args,
             env=env
         )
+        
+        # Add the Node.js executable path to the environment variables for the server process
+        node_bin_path = os.path.dirname(cmd)  # Get directory containing npx
+        if 'PATH' in os.environ:
+            server_params.env['PATH'] = f"{node_bin_path}:{os.environ['PATH']}"
+        else:
+            server_params.env['PATH'] = node_bin_path
+        
+        logger.info(f"Set PATH for {server_id} to include Node.js bin directory: {node_bin_path}")
         
         # Set a timeout for the entire operation
         try:
@@ -607,6 +631,15 @@ async def call_server_tool(
             args=args,
             env=env
         )
+        
+        # Add the Node.js executable path to the environment variables for the server process
+        node_bin_path = os.path.dirname(cmd)  # Get directory containing npx
+        if 'PATH' in os.environ:
+            server_params.env['PATH'] = f"{node_bin_path}:{os.environ['PATH']}"
+        else:
+            server_params.env['PATH'] = node_bin_path
+        
+        logger.info(f"Set PATH for {server_id} to include Node.js bin directory: {node_bin_path}")
         
         # Set a timeout for the entire operation
         try:
